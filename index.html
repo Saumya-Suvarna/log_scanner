@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Scanner</title>
+    <!-- Allow WebSocket connections from localhost:8081 -->
+    <meta http-equiv="Content-Security-Policy" content="connect-src 'self' ws://localhost:8081 http://localhost:8080;">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        #logs {
+            width: 100%;
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            background: #f8f8f8;
+        }
+
+        .log-entry {
+            white-space: pre-wrap;
+            font-family: monospace;
+            padding: 8px;
+            margin-bottom: 5px;
+            border-left: 5px solid #007bff;
+            background: #ffffff;
+        }
+
+        .log-entry:nth-child(even) {
+            background: #f1f1f1;
+        }
+
+        .log-entry.info {
+            border-left-color: #28a745;
+        }
+
+        .log-entry.warning {
+            border-left-color: #ffc107;
+        }
+
+        .log-entry.error {
+            border-left-color: #dc3545;
+        }
+
+        button {
+            margin: 5px;
+            padding: 8px;
+            cursor: pointer;
+        }
+
+        input {
+            padding: 5px;
+            margin: 5px;
+        }
+
+        #loading {
+            display: none;
+            color: #007bff;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+
+<body>
+
+    <h2>Log Viewer</h2>
+
+    <label>Filename: <input type="text" id="filename" value="install.log"></label>
+    <label>Filter: <input type="text" id="filter"></label>
+    <label>Limit: <input type="number" id="limit" value="10" min="1"></label>
+
+    <button onclick="fetchLogs()">Fetch Logs</button>
+    <button id="fetchExternal" onclick="fetchExternalLogs()">Fetch External Logs</button>
+    <button id="toggleStream" onclick="toggleWebSocket()">Start Live Stream</button>
+
+    <p id="loading">Loading logs...</p>
+
+    <h3>Logs:</h3>
+    <div id="logs"></div>
+
+    <div>
+        <button id="nextBtn" onclick="fetchLogs(nextUrl)" disabled>Next</button>
+    </div>
+
+    <p id="pagination-info"></p>
+    <script>
+        let nextUrl = null;
+        let ws = null;
+        let isStreaming = false;
+        let autoScroll = true;
+
+        async function fetchLogs(url = null) {
+            const filename = document.getElementById("filename").value;
+            const filter = document.getElementById("filter").value;
+            const limit = document.getElementById("limit").value;
+            const baseUrl = `http://localhost:8080/logs?filename=${filename}&limit=${limit}`;
+            const fullUrl = url || (filter ? `${baseUrl}&filter=${encodeURIComponent(filter)}` : baseUrl);
+
+            document.getElementById("loading").style.display = "block"; // Show loading
+
+            try {
+                const response = await fetch(fullUrl);
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error ? `${data.error.code}: ${data.error.message}` : `Error Code: ${response.status}`);
+                }
+
+                displayLogs(data.entries, true); // Clear previous logs and display new logs
+                updatePagination(data.pagination);
+            } catch (error) {
+                alert("Error fetching logs: " + error.message);
+            } finally {
+                document.getElementById("loading").style.display = "none"; // Hide loading
+            }
+        }
+
+        // Function to display logs
+        function displayLogs(entries, clearLogs = false) {
+            const logContainer = document.getElementById("logs");
+            if (clearLogs) logContainer.innerHTML = ""; // Clear previous logs if manual fetching
+
+            if (entries.length === 0) {
+                logContainer.innerHTML = "<p>No logs found.</p>";
+                return;
+            }
+
+            // For manual fetch (fetchLogs), append new entries to the bottom
+            entries.forEach(entry => {
+                const div = document.createElement("div");
+                div.className = "log-entry";
+
+                const logMessage = entry.log || "No message"; // Default message if log is empty
+                const source = entry.source || "Unknown source";
+                const file = entry.file || "Unknown file";
+
+                // Display log message, source, and file
+                div.innerHTML = `<strong>${source}</strong>: <em>${file}</em><br>${logMessage}`;
+
+                if (/\bINFO\b/i.test(logMessage)) div.classList.add("info");
+                else if (/\bWARNING\b/i.test(logMessage)) div.classList.add("warning");
+                else if (/\bERROR\b/i.test(logMessage)) div.classList.add("error");
+
+                logContainer.appendChild(div); // Append to the bottom
+            });
+
+            // Auto-scroll when new logs arrive
+            if (autoScroll) {
+                logContainer.scrollTop = logContainer.scrollHeight;
+            }
+        }
+
+        function updatePagination(pagination) {
+            if (!pagination) return;
+
+            nextUrl = pagination.next ? `http://localhost:8080${pagination.next}` : null;
+            document.getElementById("nextBtn").disabled = !pagination.has_next;
+
+            document.getElementById("pagination-info").textContent =
+                `Showing ${pagination.limit} logs. Offset: ${pagination.offset}.`;
+        }
+
+        function toggleWebSocket() {
+            if (isStreaming) {
+                stopWebSocket();
+            } else {
+                startWebSocket();
+            }
+        }
+        async function fetchExternalLogs() {
+            document.getElementById("loading").style.display = "block";
+
+            try {
+                const response = await fetch("http://localhost:8080/fetch_external_logs");
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error ? `${data.error.code}: ${data.error.message}` : `Error Code: ${response.status}`);
+                }
+
+                displayLogs(data.entries, true);
+            } catch (error) {
+                alert("Error fetching external logs: " + error.message);
+            } finally {
+                document.getElementById("loading").style.display = "none";
+            }
+        }
+        function startWebSocket() {
+            const filename = document.getElementById("filename").value;
+
+            // Open WebSocket and start streaming
+            ws = new WebSocket(`ws://localhost:8081`);
+
+            ws.onopen = function () {
+                console.log("WebSocket connected.");
+                ws.send(filename); // Send the filename to start streaming
+                isStreaming = true;
+                document.getElementById("toggleStream").textContent = "Stop Live Stream"; // Change button text to "Stop Live Stream"
+            };
+
+            ws.onmessage = function (event) {
+                // Prepend the new log entry to the top of the logs
+                const logContainer = document.getElementById("logs");
+                const div = document.createElement("div");
+                div.className = "log-entry";
+
+                const entry = JSON.parse(event.data);  // Parse the log data from WebSocket message
+                const logMessage = entry.log || "No message"; // Default message if log is empty
+                const source = entry.source || "Unknown source";
+                const file = entry.file || "Unknown file";
+
+                // Display log message, source, and file
+                div.innerHTML = `<strong>${source}</strong>: <em>${file}</em><br>${logMessage}`;
+
+                if (/\bINFO\b/i.test(logMessage)) div.classList.add("info");
+                else if (/\bWARNING\b/i.test(logMessage)) div.classList.add("warning");
+                else if (/\bERROR\b/i.test(logMessage)) div.classList.add("error");
+
+                logContainer.insertBefore(div, logContainer.firstChild); // Prepend to the top
+            };
+
+            ws.onclose = function () {
+                console.warn("WebSocket disconnected.");
+                isStreaming = false;
+                document.getElementById("toggleStream").textContent = "Start Live Stream"; // Change button text back to "Start Live Stream"
+            };
+
+            ws.onerror = function (error) {
+                console.error("WebSocket error:", error);
+                alert("WebSocket connection error. Ensure the server is running.");
+                stopWebSocket();
+            };
+        }
+
+        function stopWebSocket() {
+            if (ws) {
+                ws.close();
+                isStreaming = false;
+                console.log("WebSocket closed.");
+                document.getElementById("toggleStream").textContent = "Start Live Stream"; // Change button text back to "Start Live Stream"
+            }
+        }
+
+        // Allow toggling auto-scroll
+        document.getElementById("logs").addEventListener("scroll", function () {
+            const logsDiv = document.getElementById("logs");
+            autoScroll = logsDiv.scrollHeight - logsDiv.scrollTop <= logsDiv.clientHeight + 10;
+        });
+    </script>
+</body>
+
+</html>
